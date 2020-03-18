@@ -4,7 +4,10 @@
 
 // #include "IOHIDHandle.xm"
 
+#define kSettingsPath [NSHomeDirectory() stringByAppendingPathComponent:@"/Library/Preferences/com.cosmosgenius.screendump.plist"]
+
 static bool CCSisEnabled = true;
+static NSString *CCSPassword = nil;
 static rfbScreenInfoPtr screen;
 static bool isVNCRunning;
 // static NSCondition *condition_;
@@ -40,13 +43,29 @@ extern "C" kern_return_t IOMobileFramebufferSwapSetLayer(
 extern "C" void IOSurfaceFlushProcessorCaches(IOSurfaceRef buffer);
 extern "C" int IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern "C" int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
-static void VNCUpdateRunState(bool shouldStart);
 
 static IOSurfaceAcceleratorRef accelerator;
 static IOSurfaceRef static_buffer;
 
+static void VNCSettings(bool shouldStart, NSString *password);
+static void VNCUpdateRunState(bool shouldStart);
 static void handleVNCKeyboard(rfbBool down, rfbKeySym key, rfbClientPtr client);
 static void handleVNCPointer(int buttons, int x, int y, rfbClientPtr client);
+
+static rfbBool VNCCheck(rfbClientPtr client, const char *data, int size) {
+    NSString *password = reinterpret_cast<NSString *>(screen->authPasswdData);
+    if(!password) {
+        return TRUE;
+    }
+    if ([password length] == 0) {
+        return TRUE;
+    }
+    NSAutoreleasePool *pool([[NSAutoreleasePool alloc] init]);
+    rfbEncryptBytes(client->authChallenge, const_cast<char *>([password UTF8String]));
+    bool good(memcmp(client->authChallenge, data, size) == 0);
+    [pool release];
+    return good;
+}
 
 static void VNCSetup() {
     int argc(1);
@@ -59,7 +78,9 @@ static void VNCSetup() {
     screen->serverFormat.blueShift = bits_per_sample * 0;
     screen->kbdAddEvent = &handleVNCKeyboard;
     screen->ptrAddEvent = &handleVNCPointer;
+    screen->passwordCheck = &VNCCheck;
     free(arg0);
+    VNCUpdateRunState(CCSisEnabled);
 }
 
 static void VNCBlack() {
@@ -113,9 +134,24 @@ static void initialBuffer() {
     }
 }
 
+static void VNCSettings(bool shouldStart, NSString* password) {
+    CCSisEnabled = shouldStart;
+    if(password) {
+        CCSPassword = password;
+    }
+    NSString *sEnabled = CCSisEnabled ? @"YES": @"NO";
+    // NSLog(@"screendump: Settings(Enabled:%@, Password:%@)", sEnabled, CCSPassword);
+    VNCUpdateRunState(CCSisEnabled);
+}
+
 static void VNCUpdateRunState(bool shouldStart) {
     if(screen == NULL) {
         return;
+    }
+    if(CCSPassword && CCSPassword.length) {
+        screen->authPasswdData = (void *) CCSPassword;
+    } else {
+        screen->authPasswdData = NULL;
     }
     if(shouldStart == isVNCRunning) {
         return;
@@ -164,14 +200,28 @@ static void OnFrameUpdate(IOMobileFramebufferRef fb, IOSurfaceRef buffer) {
     rfbMarkRectAsModified(screen, 0, 0, width, height);
 }
 
-static void loadPrefs()
+static void loadPrefs(void)
 {
-    CFPreferencesAppSynchronize(CFSTR("com.cosmosgenius.screendump"));
-    Boolean valid;
-    bool enabled(CFPreferencesGetAppBooleanValue(CFSTR("CCSisEnabled"), CFSTR("com.cosmosgenius.screendump"), &valid));
-    CCSisEnabled = enabled;
-    @synchronized (lock) {
-        VNCUpdateRunState(CCSisEnabled);
+    NSDictionary* prefs = nil;
+    CFStringRef appID = CFSTR("com.cosmosgenius.screendump");
+    CFArrayRef keyList = CFPreferencesCopyKeyList(appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if(keyList) {
+        prefs = (NSDictionary *)CFPreferencesCopyMultiple(keyList, appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        if(!prefs) {
+            prefs = [NSDictionary new];
+        }
+        CFRelease(keyList);
+    }
+
+    if(!prefs) {
+        prefs = [NSDictionary dictionaryWithContentsOfFile:kSettingsPath];
+    }
+
+    if(prefs) {
+        bool isEnabled = [prefs objectForKey:@"CCSisEnabled"] ? [[prefs objectForKey:@"CCSisEnabled"] boolValue] : CCSisEnabled;
+        NSString *password = [prefs objectForKey:@"CCSPassword"];
+        [prefs release];
+        VNCSettings(isEnabled, password);
     }
 }
 
@@ -187,7 +237,6 @@ static void loadPrefs()
         NULL, (CFNotificationCallback)loadPrefs,
         CFSTR("com.cosmosgenius.screendump/preferences.changed"),
         NULL, CFNotificationSuspensionBehaviorCoalesce);
-    lock = [[NSLock alloc] init];
     loadPrefs();
 }
 
@@ -418,6 +467,5 @@ static void handleVNCKeyboard(rfbBool down, rfbKeySym key, rfbClientPtr client) 
 }
 
 static void handleVNCPointer(int buttons, int x, int y, rfbClientPtr client) {
-    NSLog(@"sharat %ld %ld %ld", buttons, x, y);
     VNCPointer(buttons, x, y, client);
 }
